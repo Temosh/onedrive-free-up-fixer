@@ -309,6 +309,7 @@ struct Item {
 struct FileState {
     let onDisk: Bool
     let policy: String  // macOS content policy: 1 normal, 3 keep downloaded
+    let uploaded: String  // macOS decoration_is_uploaded: 1 = the cloud copy is complete
     let pin: String     // OneDrive lastKnownPinState: empty/0 normal, 1 always keep, 2 freed
     let flags: String   // OneDrive dbfs state_flags; bit 8 = "freed" mark
     let caps: String    // OneDrive dbfs capabilities: -1 normal, 47 left over from a pin
@@ -326,13 +327,13 @@ func relativePath(_ url: URL) -> String {
 @discardableResult
 func snapshot(_ stage: String, _ items: [Item], fileProviderDB: String?) -> [FileState] {
     let ids = items.compactMap(\.id).filter { !$0.isEmpty && $0.allSatisfy(\.isNumber) }
-    var policy: [String: String] = [:], fsid: [String: String] = [:]
+    var policy: [String: String] = [:], uploaded: [String: String] = [:], fsid: [String: String] = [:]
     var flags: [String: String] = [:], pin: [String: String] = [:], caps: [String: String] = [:]
     if !ids.isEmpty {
         if let db = fileProviderDB {
             let blobs = ids.map { "CAST('\($0)' AS BLOB)" }.joined(separator: ",")
-            for row in query(db, "SELECT CAST(id AS TEXT), decoration_content_policy FROM FP_snapshot WHERE id IN (\(blobs));")
-            where row.count == 2 { policy[row[0]] = row[1] }
+            for row in query(db, "SELECT CAST(id AS TEXT), decoration_content_policy, decoration_is_uploaded FROM FP_snapshot WHERE id IN (\(blobs));")
+            where row.count == 3 { policy[row[0]] = row[1]; uploaded[row[0]] = row[2] }
         }
         for row in query(oneDriveDB, "SELECT itemid, fsid, state_flags, capabilities FROM dbfs_files WHERE itemid IN (\(ids.joined(separator: ",")));")
         where row.count == 4 { fsid[row[0]] = row[1]; flags[row[0]] = row[2]; caps[row[0]] = row[3] }
@@ -350,11 +351,11 @@ func snapshot(_ stage: String, _ items: [Item], fileProviderDB: String?) -> [Fil
         let bytes = Int64(st?.st_blocks ?? 0) * 512
         let id = item.id ?? ""
         let pinValue = fsid[id].flatMap { pin[$0] }.map { $0.isEmpty ? "empty" : $0 } ?? "?"
-        let state = FileState(onDisk: onDisk, policy: policy[id] ?? "?", pin: pinValue, flags: flags[id] ?? "?",
-                              caps: caps[id] ?? "?")
+        let state = FileState(onDisk: onDisk, policy: policy[id] ?? "?", uploaded: uploaded[id] ?? "?", pin: pinValue,
+                              flags: flags[id] ?? "?", caps: caps[id] ?? "?")
         states.append(state)
         runLog([stage, time, relativePath(item.url), id, onDisk ? "on-disk" : "cloud-only", String(bytes),
-                state.policy, state.pin, state.flags, state.caps].joined(separator: "\t"))
+                state.policy, state.uploaded, state.pin, state.flags, state.caps].joined(separator: "\t"))
     }
     event("\(stage): \(states.filter(\.onDisk).count) on disk, \(states.filter { $0.policy == "3" }.count) at policy 3, "
           + "\(states.filter(\.marked).count) marked by OneDrive, \(states.filter { $0.caps == "47" }.count) with pin capabilities "
@@ -392,7 +393,7 @@ func forceFreeUp(_ urls: [URL]) {
     stamp.dateFormat = "yyyyMMdd-HHmmss"
     try? FileManager.default.createDirectory(at: runLogDir, withIntermediateDirectories: true)
     runLogURL = runLogDir.appendingPathComponent("run-\(stamp.string(from: Date())).tsv")
-    runLog("stage\ttime\tfile\titem_id\tlocation\tbytes_on_disk\tmacos_policy\tonedrive_pin\tonedrive_flags\tonedrive_caps")
+    runLog("stage\ttime\tfile\titem_id\tlocation\tbytes_on_disk\tmacos_policy\tmacos_uploaded\tonedrive_pin\tonedrive_flags\tonedrive_caps")
     event("run log: \(runLogURL!.path)")
     event("selection: \(urls.map(relativePath).joined(separator: ", "))")
 
@@ -416,6 +417,13 @@ func forceFreeUp(_ urls: [URL]) {
         return
     }
     let files = work.map(\.0.url).filter(isDownloadedFile)
+    // Only free files macOS confirms as fully uploaded: freeing removes the local copy, so the
+    // cloud copy must be complete. Anything else stays on disk and is reported.
+    let uploadedPaths = Set(work.filter { $0.1.uploaded == "1" }.map { $0.0.url.path })
+    let toEvict = files.filter { uploadedPaths.contains($0.path) }
+    let notUploaded = files.filter { !uploadedPaths.contains($0.path) }
+    for file in notUploaded { event("skipped: not fully uploaded: \(relativePath(file))") }
+    let notUploadedPaths = Set(notUploaded.map(\.path))
     let ids = work.compactMap(\.0.id)
     event("item ids (for rollback): \(ids.joined(separator: " "))")
 
@@ -470,7 +478,7 @@ func forceFreeUp(_ urls: [URL]) {
     // 3. Free the downloaded files with the macOS call (none when only repairing records).
     var freed: Int64 = 0, failed = 0
     if files.isEmpty { event("no downloaded files, skipping evict") }
-    for file in files {
+    for file in toEvict {
         let size = Int64(fileStat(file)?.st_blocks ?? 0) * 512
         do {
             try FileManager.default.evictUbiquitousItem(at: file)
@@ -480,7 +488,8 @@ func forceFreeUp(_ urls: [URL]) {
             event("evict failed: \(relativePath(file)): \(error.localizedDescription)")
         }
     }
-    event("evicted \(files.count - failed) of \(files.count) downloaded files")
+    event("evicted \(toEvict.count - failed) of \(toEvict.count) uploaded downloaded files"
+          + (notUploaded.isEmpty ? "" : "; \(notUploaded.count) not fully uploaded kept"))
     snapshot("after-evict", items, fileProviderDB: fileProviderDB)
 
     // 4. OneDrive records: clear its "freed" marks and set pin state to 0, so neither OneDrive nor
@@ -495,7 +504,8 @@ func forceFreeUp(_ urls: [URL]) {
     let final = snapshot("final", items, fileProviderDB: fileProviderDB)
 
     var backOnDisk = 0, atPolicyThree = 0
-    for (item, state) in zip(items, final) where !pinnedPaths.contains(item.url.path)
+    for (item, state) in zip(items, final)
+    where !pinnedPaths.contains(item.url.path) && !notUploadedPaths.contains(item.url.path)
         && (state.onDisk || state.policy == "3" || state.marked || state.caps == "47") {
         var issues: [String] = []
         if state.onDisk { issues.append("on disk"); backOnDisk += 1 }
@@ -507,11 +517,12 @@ func forceFreeUp(_ urls: [URL]) {
 
     let freedText = ByteCountFormatter.string(fromByteCount: freed, countStyle: .file)
     var summary = files.isEmpty ? "Nothing to free, records of \(fileCount(work.count)) repaired"
-                                : "Freed \(freedText) from \(fileCount(files.count - failed))"
+                                : "Freed \(freedText) from \(fileCount(toEvict.count - failed))"
     if failed > 0 { summary += ", \(failed) failed" }
     if backOnDisk > 0 { summary += ", \(fileCount(backOnDisk)) back on disk" }
     if atPolicyThree > 0 { summary += ", \(fileCount(atPolicyThree)) at keep-downloaded" }
     if !pinnedPaths.isEmpty { summary += ", \(fileCount(pinnedPaths.count)) kept on device (pinned) skipped" }
+    if !notUploaded.isEmpty { summary += ", \(fileCount(notUploaded.count)) not fully uploaded kept on disk" }
     if !marksCleared { summary += ". OneDrive records not updated, see log" }
     summary += ". Start OneDrive when you're done"
     event(summary)

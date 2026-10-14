@@ -6,6 +6,31 @@ Adds **Repair & Free Up Unpinned Files** to Finder's right-click menu for OneDri
 on macOS. It frees files that OneDrive's own "Free Up Space" can't, or that
 re-download right after being freed.
 
+## ⚠️ Read this first
+
+**Use at your own risk.** This is an unofficial tool, not affiliated with, endorsed by or
+supported by Microsoft or Apple. It edits private, undocumented databases of macOS's File
+Provider and of OneDrive, and evicts the local copies of files. It was tested on one Mac with
+the versions listed under [Proven on](#proven-on). Any OneDrive or macOS update can change how
+these databases work. There is no guarantee that it won't break your OneDrive sync or lose
+data.
+
+**Before you use it:**
+
+- **Make sure the files are fully uploaded and up to date in OneDrive.** The OneDrive menu bar
+  icon should show no pending uploads or sync errors, and the files should show as synced in
+  Finder. Freeing a file removes its local copy, so the copy in OneDrive is then the only one.
+  The app also refuses to free any file that macOS doesn't report as fully uploaded, but don't
+  rely on that alone.
+- **Have a backup** of anything you can't afford to lose (for example Time Machine, or another
+  copy outside OneDrive).
+- **Try it on one expendable file first**, especially after any OneDrive or macOS update.
+- **Understand Full Disk Access.** The app needs it to edit the File Provider database. Only
+  grant it if you've read the code or trust it.
+
+The app backs up OneDrive's databases before each run and logs every change (see
+[Rollback](#rollback)). Those backups don't cover your files.
+
 ## The problem
 
 With OneDrive on Apple's File Provider (`~/Library/CloudStorage/OneDrive-*`), files can stay
@@ -63,7 +88,9 @@ For the selected files and folders it:
    cloud-only (`Resources/fp_set_policy.py`, only rows actually at 3). If anything changed,
    it restarts `fileproviderd` and waits 30 s.
 5. Evicts the downloaded files with `FileManager.evictUbiquitousItem`, not OneDrive's
-   action. Finder's `.DS_Store` files are skipped.
+   action, but **only files macOS reports as fully uploaded** (`decoration_is_uploaded`).
+   Any other file stays on disk, is listed in the log as `skipped: not fully uploaded`, and is
+   counted in the notification. Finder's `.DS_Store` files are skipped.
 6. Repairs OneDrive's records for those files: pin state 2/empty → 0, "freed" flag off, and
    `capabilities` 47 → -1 (left over from "Always Keep on This Device"), with integrity
    checks.
@@ -78,9 +105,10 @@ Every run writes a detailed log, `~/Library/Logs/OneDriveFreeUpFixer/run-<date-t
 
 - one line per file per stage: `before`, `after-macos-fix`, `after-evict`,
   `after-onedrive-fix`, `final`;
-- each line has the location (on disk or cloud-only), bytes on disk, macOS policy,
-  OneDrive pin state, OneDrive flags and OneDrive capabilities;
-- timestamped `event` lines record every step: skipped pinned files, helper stopped, backup
+- each line has the location (on disk or cloud-only), bytes on disk, macOS policy, macOS
+  "fully uploaded" state, OneDrive pin state, OneDrive flags and OneDrive capabilities;
+- timestamped `event` lines record every step: skipped pinned and not-uploaded files,
+  helper stopped, backup
   path, the `fileproviderd` restart, evict failures, record changes and integrity checks,
   the item IDs for rollback;
 - at the end, a `problem:` line for every unpinned file that's still on disk, at policy 3,
