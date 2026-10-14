@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build, install to ~/Applications and register the "Force Free Up Space" Finder service.
+# Build, install to ~/Applications and register the "Repair & Free Up Unpinned Files" Finder service.
 set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 NAME="OneDrive Free Up Fixer.app"
