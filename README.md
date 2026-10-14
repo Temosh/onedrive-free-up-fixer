@@ -240,6 +240,10 @@ then `fetch-content(<id>) why:materialization|itemChangedRemotely|backgroundWork
   them for the whole selection.
 - **While OneDrive is running, it marks freed files** (pin state 2, flag). With OneDrive
   stopped during eviction, it doesn't. With caps -1 the marks are harmless.
+- **"Sync pending" arrows after a repair.** Files that were pinned and then unpinned can
+  lose OneDrive's bit 32 (`state_flags` 3 instead of 35). Finder shows round arrows on them
+  even after a repair. OneDrive's own Free Up Space on the folder restores the bit; it's
+  harmless (see the untested improvement below).
 - **Stopping OneDrive while files are downloading can fail.** macOS relaunches OneDrive's
   File Provider helper to finish the queue. That's what makes a run report "couldn't stop
   OneDrive", and OneDrive may look like it crashed.
@@ -264,9 +268,11 @@ grep "FP snapshot mutation: update" /tmp/fp_log.txt | grep -o 'cp:[a-zA-Z]*' | s
 grep "persist job: <FP.*fetch-content(" /tmp/fp_log.txt
 ```
 
-## Possible improvement (not tested yet)
+## Possible improvements (not tested yet)
 
-**Only repair what causes the problem.** Today the app also counts OneDrive's "freed" mark
+### Only repair what causes the problem
+
+Today the app also counts OneDrive's "freed" mark
 (`state_flags` bit 8) and an empty or 2 pin state as needing repair. It clears those marks
 and sets pin state to 0. These aren't the cause. Once `capabilities` is -1, OneDrive's own
 Free Up Space sent `lazy` whatever the pin state or mark was. The mark is just OneDrive's
@@ -282,6 +288,27 @@ The idea:
 - keep logging them for visibility.
 
 This hasn't been implemented or tested yet.
+
+### Treat OneDrive's "sync pending" state as not clean
+
+**What was seen.** Files that went through "Always Keep on This Device" and then OneDrive's
+Free Up Space can lose bit 32 in OneDrive's `state_flags`, ending at **3** instead of 35.
+Finder then shows OneDrive's round **"sync pending" arrows** on them.
+
+Every other file in OneDrive had bit 32 set: 35, 37, 43, 101. It's very likely OneDrive's
+"in sync" flag.
+
+The app doesn't touch bit 32. So after a repair those files are freed and correct (policy 1,
+capabilities -1) but still show the arrows. The app's final check calls them clean, because
+it doesn't look at bit 32.
+
+OneDrive's own Free Up Space on the folder restored the bit (3 → 43) within about a minute.
+It sent `lazy` and downloaded nothing, and the arrows disappeared.
+
+**The idea:** report files without bit 32 in the final check, for example as
+`problem: sync pending (OneDrive flags without bit 32)`, so "clean" really means clean.
+Don't set the bit in the app, because OneDrive restores it by itself. Not implemented or
+tested yet.
 
 ## Releases
 
