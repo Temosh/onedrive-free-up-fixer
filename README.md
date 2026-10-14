@@ -264,6 +264,25 @@ grep "FP snapshot mutation: update" /tmp/fp_log.txt | grep -o 'cp:[a-zA-Z]*' | s
 grep "persist job: <FP.*fetch-content(" /tmp/fp_log.txt
 ```
 
+## Possible improvement (not tested yet)
+
+**Only repair what causes the problem.** Today the app also counts OneDrive's "freed" mark
+(`state_flags` bit 8) and an empty or 2 pin state as needing repair. It clears those marks
+and sets pin state to 0. These aren't the cause. Once `capabilities` is -1, OneDrive's own
+Free Up Space sent `lazy` whatever the pin state or mark was. The mark is just OneDrive's
+normal "freed" bookkeeping: after you use OneDrive's own Free Up Space on a repaired folder,
+every file gets it again, and the app then reports "records of N files repaired" although
+nothing was wrong.
+
+The idea:
+
+- count only macOS policy 3 and `capabilities` 47 as needing repair (plus downloaded files to
+  free);
+- leave pin state and the mark alone, which means fewer edits to OneDrive's database;
+- keep logging them for visibility.
+
+This hasn't been implemented or tested yet.
+
 ## Releases
 
 Pushing a tag like `v1.0.0` runs `.github/workflows/release.yml` on an Apple Silicon GitHub
