@@ -11,7 +11,6 @@ let provenOneDrive = "26.168.0830"
 let provenMacOSBuild = "25G83"
 let home = FileManager.default.homeDirectoryForCurrentUser
 let logURL = home.appendingPathComponent("Library/Logs/OneDriveFreeUpFixer.log")
-let policyScript = Bundle.main.url(forResource: "fp_set_policy", withExtension: "py")!.path
 
 func log(_ text: String) {
     let line = "\(Date()) \(text)\n"
@@ -401,7 +400,8 @@ func forceFreeUp(_ urls: [URL]) {
     // fileproviderd restart, so they get fixed too.
     let allFiles = regularFiles(in: urls)
     let items = allFiles.map { Item(url: $0, id: itemIdentifier($0)) }
-    var fileProviderDB = items.lazy.compactMap(\.id).first.flatMap { findFileProviderDB(containing: $0) }
+    // Find macOS's File Provider database by the first few files (one may not be in it yet).
+    let fileProviderDB = items.compactMap(\.id).prefix(20).lazy.compactMap { findFileProviderDB(containing: $0) }.first
     let before = snapshot("before", items, fileProviderDB: fileProviderDB)
 
     // Intentionally pinned files are left completely alone: freeing them without a real unpin
@@ -457,17 +457,20 @@ func forceFreeUp(_ urls: [URL]) {
     event("OneDrive backup: \(backup.path)")
 
     // 2. macOS records: policy 3 -> 1, then let fileproviderd reload and settle.
-    let result = shell("/usr/bin/python3", ["-I", policyScript, "auto"] + ids)
-    event("fp_set_policy: status \(result.status): \(result.output.replacingOccurrences(of: "\n", with: " | "))")
-    guard result.status == 0 else {
-        notify("Couldn't update File Provider records. Grant Full Disk Access to \(appName). Log: ~/Library/Logs/OneDriveFreeUpFixer.log")
+    guard let policyDB = fileProviderDB else {
+        event("couldn't find macOS's File Provider database for these files")
+        notify("Couldn't find the File Provider records. Grant Full Disk Access to \(appName). Log: ~/Library/Logs/OneDriveFreeUpFixer.log")
         return
     }
-    if let db = result.output.split(separator: "\n").first(where: { $0.hasPrefix("database: ") }) {
-        fileProviderDB = String(db.dropFirst("database: ".count))
+    let changed: Int
+    do {
+        changed = try setContentPolicy(ids, database: policyDB)
+    } catch {
+        event("macOS records: update failed, nothing changed: \(error)")
+        notify("Couldn't update File Provider records. Log: ~/Library/Logs/OneDriveFreeUpFixer.log")
+        return
     }
-    let changed = result.output.range(of: #"updated (\d+) of"#, options: .regularExpression)
-        .flatMap { Int(result.output[$0].split(separator: " ")[1]) } ?? 0
+    event("macOS records: policy 3 -> 1 for \(changed) of \(ids.count) files (\(policyDB))")
     if changed > 0 {
         shell("/usr/bin/killall", ["fileproviderd"])
         event("fileproviderd restarted, waiting 30 s")

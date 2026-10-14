@@ -85,7 +85,7 @@ For the selected files and folders it:
    backs up OneDrive's two databases to
    `~/Library/Application Support/OneDriveFreeUpFixer/backups/` (newest 5 kept).
 4. Sets macOS policy 3 → 1 for every unpinned file in the selection, downloaded or
-   cloud-only (`Resources/fp_set_policy.py`, only rows actually at 3). If anything changed,
+   cloud-only (`Sources/ContentPolicy.swift`, only rows actually at 3). If anything changed,
    it restarts `fileproviderd` and waits 30 s.
 5. Evicts the downloaded files with `FileManager.evictUbiquitousItem`, not OneDrive's
    action, but **only files macOS reports as fully uploaded** (`decoration_is_uploaded`).
@@ -132,15 +132,32 @@ then update `provenOneDrive` / `provenMacOSBuild` in `Sources/main.swift`.
 
 ## Install
 
-Requires the Xcode Command Line Tools (`swiftc`, `python3`).
+**Apple Silicon Macs only, macOS 13 or later.** The app needs nothing else installed.
+
+### From a release
+
+1. Download `OneDrive-Free-Up-Fixer-<version>.zip` from
+   [Releases](https://github.com/Temosh/onedrive-free-up-fixer/releases) and unzip it.
+2. Move **OneDrive Free Up Fixer** to `~/Applications` (or `/Applications`).
+3. Open it once. macOS blocks it, because it isn't signed by an identified developer. Go to
+   **System Settings → Privacy & Security** and click **Open Anyway**. The app has no window:
+   it runs in the background and quits by itself.
+4. Give it Full Disk Access (below).
+
+### From source
+
+Requires the Xcode Command Line Tools (`swiftc`).
 
 ```sh
 ./scripts/install.sh
 ```
 
-This builds the app, installs it to `~/Applications`, registers the Finder service and
-shows the app in Finder. Then give it Full Disk Access, which it needs to edit the File
-Provider database:
+This builds the app, installs it to `~/Applications`, registers the Finder service and shows
+the app in Finder.
+
+### Full Disk Access
+
+The app needs it to edit the File Provider database:
 
 1. Open **System Settings → Privacy & Security → Full Disk Access**.
 2. Drag **OneDrive Free Up Fixer** from the Finder window into the list, or click **+**,
@@ -150,8 +167,9 @@ Provider database:
 - macOS has no permission prompt for Full Disk Access, so the app can't ask for it. It
   checks before doing anything, and if access is missing it explains and opens the
   settings page for you.
-- The build is ad-hoc signed, so each re-install changes its signature. Remove the old
-  entry (**−**) and add the app again, because toggling the switch isn't enough.
+- The app is ad-hoc signed, so each new version or re-install changes its signature.
+  Remove the old entry (**−**) and add the app again, because toggling the switch isn't
+  enough.
 - If the menu item doesn't appear, enable it under **System Settings → Keyboard →
   Keyboard Shortcuts → Services → Files and Folders**.
 
@@ -164,6 +182,7 @@ Full Disk Access:
 
 ```sh
 python3 -I Resources/fp_set_policy.py --from 1 --to 3 auto <ids...>; killall fileproviderd
+# (this rollback script needs python3, from the Xcode Command Line Tools)
 ```
 
 **OneDrive records:** quit OneDrive, copy the files from the run's backup folder
@@ -244,6 +263,12 @@ built-in):
 grep "FP snapshot mutation: update" /tmp/fp_log.txt | grep -o 'cp:[a-zA-Z]*' | sort | uniq -c
 grep "persist job: <FP.*fetch-content(" /tmp/fp_log.txt
 ```
+
+## Releases
+
+Pushing a tag like `v1.0.0` runs `.github/workflows/release.yml` on an Apple Silicon GitHub
+runner. It builds the app with that version, zips it with a SHA-256 checksum, and publishes a
+GitHub Release with the install steps from `.github/release-notes.md`.
 
 ## Icon
 
