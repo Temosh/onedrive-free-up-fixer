@@ -77,7 +77,8 @@ For the selected files and folders it:
    that OneDrive isn't running. It also compares the OneDrive/macOS versions with the proven
    ones, and asks before continuing if they differ.
 2. Leaves **intentionally pinned files** alone. Those are files set to "Always Keep on This
-   Device", directly or through a pinned folder (OneDrive's pinned bit in `state_flags`).
+   Device", directly or through a pinned folder (OneDrive's pinned flag: `state_flags` bit 2,
+   value 4).
    Freeing them without a real unpin would leave OneDrive believing they're pinned. To free
    them, turn off "Always Keep on This Device" in OneDrive first. Skipped files are listed
    in the log and counted in the notification.
@@ -228,7 +229,7 @@ then `fetch-content(<id>) why:materialization|itemChangedRemotely|backgroundWork
 
 - **Pin state:** files at pin state 0 still got `keepDownloaded` while caps was 47.
   OneDrive also resets pin state to empty on its own.
-- **OneDrive's "freed" flag** (`state_flags` bit 8).
+- **OneDrive's "freed" flag** (`state_flags` bit 3, value 8).
 - `in_materialized_set`.
 - **Download history:** it correlates, because only downloaded files were ever pinned,
   but it isn't the cause.
@@ -241,7 +242,8 @@ then `fetch-content(<id>) why:materialization|itemChangedRemotely|backgroundWork
 - **While OneDrive is running, it marks freed files** (pin state 2, flag). With OneDrive
   stopped during eviction, it doesn't. With caps -1 the marks are harmless.
 - **"Sync pending" arrows after a repair.** Files that were pinned and then unpinned can
-  lose OneDrive's bit 32 (`state_flags` 3 instead of 35). Finder shows round arrows on them
+  lose OneDrive's "in sync" flag (`state_flags` bit 5, value 32: 3 instead of 35). Finder
+  shows round arrows on them
   even after a repair. OneDrive's own Free Up Space on the folder restores the bit; it's
   harmless (see the untested improvement below).
 - **Stopping OneDrive while files are downloading can fail.** macOS relaunches OneDrive's
@@ -250,7 +252,8 @@ then `fetch-content(<id>) why:materialization|itemChangedRemotely|backgroundWork
 
 **Find leftover pin capabilities** (read-only, works without Full Disk Access). This lists
 files at caps 47 that aren't pinned now, per folder. Intentional pins are recognised by the
-"pinned" bit in `state_flags` (`& 4`); files pinned through a parent folder have that bit
+"pinned" flag (`state_flags` bit 2, value 4: `state_flags & 4`); files pinned through a
+parent folder have that flag
 but an empty pin state.
 
 ```sh
@@ -268,12 +271,105 @@ grep "FP snapshot mutation: update" /tmp/fp_log.txt | grep -o 'cp:[a-zA-Z]*' | s
 grep "persist job: <FP.*fetch-content(" /tmp/fp_log.txt
 ```
 
+## Reference: the fields involved
+
+Microsoft and Apple don't document these databases. `capabilities` and macOS's content policy
+use Apple's public File Provider values; everything else comes from observation on one Mac,
+about 187,000 OneDrive files, on the versions under [Proven on](#proven-on).
+
+### Bitmasks in general
+
+Some of these fields are **bitmasks**: one integer whose bits are independent on/off
+switches. Bit *n* (counted from 0) has the value 2^*n*, and the stored number is the sum of
+the values of the bits that are on.
+
+- To decode: 43 = 32 + 8 + 2 + 1, so bits 5, 3, 1 and 0 are on (binary `0101011`).
+- To test one switch, use bitwise AND, e.g. `state_flags & 8` is non-zero when bit 3 is
+  on, whatever the other bits are.
+- Any combination is a valid number. For example 10 = 8 + 2 (bits 3 and 1), though OneDrive
+  was never seen producing it.
+
+The app and the scripts always test single bits, never whole values.
+
+### OneDrive `state_flags`
+
+`OneDrive.dat`, table `dbfs_files`. It's an SQLite integer (up to 64 bits); the values seen
+use bits 0–6.
+
+| Bit | Value | Meaning | Evidence |
+|---|---|---|---|
+| 0 | 1 | on every item except OneDrive's hidden marker file (12) | ~187,000 items |
+| 1 | 2 | on for normal files; off for pinned files and folders | inferred |
+| 2 | 4 | **pinned** ("Always Keep on This Device"), on the file itself or inherited from a pinned folder | confirmed: all ~18,000 pinned files |
+| 3 | 8 | OneDrive's **"freed" mark**, set when OneDrive frees a file; also seen on folders whose contents changed | observed; harmless once `capabilities` is -1 |
+| 4 | 16 | seen only on a few folders | unknown |
+| 5 | 32 | **"in sync"**; when off, Finder shows OneDrive's round "sync pending" arrows | inferred: on for every file except 13 that went through a pin and unpin |
+| 6 | 64 | seen on 5 pinned files | unknown |
+
+Values seen on files:
+
+| Value | Binary | Bits on | Meaning | Files |
+|---|---|---|---|---|
+| 35 | `0100011` | 5, 1, 0 | normal, in sync | ~169,000 |
+| 37 | `0100101` | 5, 2, 0 | pinned, in sync | ~18,100 |
+| 43 | `0101011` | 5, 3, 1, 0 | normal, in sync, freed by OneDrive | varies |
+| 3 | `0000011` | 1, 0 | normal, **not** in sync (round arrows) | 13 |
+| 101 | `1100101` | 6, 5, 2, 0 | pinned, in sync, unknown bit 6 | 5 |
+| 12 | `0001100` | 3, 2 | OneDrive's hidden marker file in its root folder | 1 |
+
+### OneDrive `capabilities`
+
+`OneDrive.dat`, table `dbfs_files`. This is Apple's `NSFileProviderItemCapabilities` bitmask:
+what macOS may do with the file.
+
+| Bit | Value | Apple name | In 47? |
+|---|---|---|---|
+| 0 | 1 | allowsReading | yes |
+| 1 | 2 | allowsWriting | yes |
+| 2 | 4 | allowsReparenting (move) | yes |
+| 3 | 8 | allowsRenaming | yes |
+| 4 | 16 | allowsTrashing | **no** |
+| 5 | 32 | allowsDeleting | yes |
+| 6 | 64 | allowsEvicting (free up) | **no** |
+| 7 | 128 | allowsExcludingFromSync | no |
+
+- **-1** has every bit set: "default, everything allowed". Normal files have it (~167,000).
+- **47** (`0101111`) is the value OneDrive stores when a file is pinned: no evicting, no
+  trashing.
+- **The bug:** unpinning doesn't set it back to -1.
+
+### OneDrive `lastKnownPinState`
+
+`SyncEngineDatabase.db`, table `od_ClientFile_Records`. A plain number, not a bitmask.
+
+| Value | Meaning |
+|---|---|
+| empty (NULL) | no record; OneDrive also resets it to this by itself after restarts |
+| 0 | normal |
+| 1 | pinned ("Always Keep on This Device") |
+| 2 | freed by OneDrive's own Free Up Space |
+
+This isn't the cause of the problem: files at 0 still got `keepDownloaded` while
+`capabilities` was 47.
+
+### macOS File Provider fields
+
+`~/Library/Application Support/FileProvider/<domain>/database/db`, table `FP_snapshot` (needs
+Full Disk Access). Plain numbers.
+
+| Field | Values |
+|---|---|
+| `decoration_content_policy` | Apple's `NSFileProviderContentPolicy`: 0 inherited, **1** download lazily (normal), 2 download lazily and evict on remote update, **3** download eagerly and keep downloaded. `fileproviderctl evaluate` prints the number; the system log prints names (`cp:lazy`, `cp:keepDownloaded`). |
+| `metadata_is_evictable` | 4 for normal files, 5 for policy-3 files (observed) |
+| `decoration_is_uploaded` | 1 when the cloud copy is complete. The app only frees such files. |
+
 ## Possible improvements (not tested yet)
 
 ### Only repair what causes the problem
 
 Today the app also counts OneDrive's "freed" mark
-(`state_flags` bit 8) and an empty or 2 pin state as needing repair. It clears those marks
+(`state_flags` bit 3, value 8) and an empty or 2 pin state as needing repair. It clears those
+marks
 and sets pin state to 0. These aren't the cause. Once `capabilities` is -1, OneDrive's own
 Free Up Space sent `lazy` whatever the pin state or mark was. The mark is just OneDrive's
 normal "freed" bookkeeping: after you use OneDrive's own Free Up Space on a repaired folder,
@@ -292,21 +388,22 @@ This hasn't been implemented or tested yet.
 ### Treat OneDrive's "sync pending" state as not clean
 
 **What was seen.** Files that went through "Always Keep on This Device" and then OneDrive's
-Free Up Space can lose bit 32 in OneDrive's `state_flags`, ending at **3** instead of 35.
+Free Up Space can lose OneDrive's "in sync" flag (`state_flags` bit 5, value 32), ending at
+**3** instead of 35.
 Finder then shows OneDrive's round **"sync pending" arrows** on them.
 
-Every other file in OneDrive had bit 32 set: 35, 37, 43, 101. It's very likely OneDrive's
+Every other file in OneDrive had bit 5 set: 35, 37, 43, 101. It's very likely OneDrive's
 "in sync" flag.
 
-The app doesn't touch bit 32. So after a repair those files are freed and correct (policy 1,
+The app doesn't touch bit 5. So after a repair those files are freed and correct (policy 1,
 capabilities -1) but still show the arrows. The app's final check calls them clean, because
-it doesn't look at bit 32.
+it doesn't look at bit 5.
 
 OneDrive's own Free Up Space on the folder restored the bit (3 → 43) within about a minute.
 It sent `lazy` and downloaded nothing, and the arrows disappeared.
 
-**The idea:** report files without bit 32 in the final check, for example as
-`problem: sync pending (OneDrive flags without bit 32)`, so "clean" really means clean.
+**The idea:** report files without bit 5 (value 32) in the final check, for example as
+`problem: sync pending (OneDrive flags without bit 5)`, so "clean" really means clean.
 Don't set the bit in the app, because OneDrive restores it by itself. Not implemented or
 tested yet.
 
