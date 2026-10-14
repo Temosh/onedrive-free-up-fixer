@@ -90,12 +90,16 @@ func isDownloadedFile(_ url: URL) -> Bool {
     return st.st_flags & datalessFlag == 0
 }
 
-func downloadedFiles(in urls: [URL]) -> [URL] {
+// Every regular file in the selection, downloaded or cloud-only (Finder's .DS_Store skipped).
+func regularFiles(in urls: [URL]) -> [URL] {
+    func isRegular(_ url: URL) -> Bool {
+        url.lastPathComponent != ".DS_Store" && (fileStat(url).map { ($0.st_mode & S_IFMT) == S_IFREG } ?? false)
+    }
     var files: [URL] = []
     for url in urls {
-        if isDownloadedFile(url) { files.append(url); continue }
+        if isRegular(url) { files.append(url); continue }
         guard let walker = FileManager.default.enumerator(at: url, includingPropertiesForKeys: nil) else { continue }
-        for case let file as URL in walker where isDownloadedFile(file) {
+        for case let file as URL in walker where isRegular(file) {
             files.append(file)
         }
     }
@@ -156,6 +160,96 @@ func versionMismatch() -> String? {
         + "Try it on one expendable file first, then update the proven versions."
 }
 
+// OneDrive's own records. Its "freed" marks (pin state 2, flag bit 8) get pushed back to macOS
+// as "keep downloaded" later, so they are cleared for the files we free.
+let oneDriveDB = home.appendingPathComponent(
+    "Library/Group Containers/UBF8T346G9.OneDriveSyncClientSuite/OneDrive.noindex/OneDrive.dat").path
+let syncEngineDB = home.appendingPathComponent(
+    "Library/Containers/com.microsoft.OneDrive-mac/Data/Library/Application Support/OneDrive/settings/Personal/SyncEngineDatabase.db").path
+let backupRoot = home.appendingPathComponent("Library/Application Support/OneDriveFreeUpFixer/backups")
+let backupsToKeep = 5
+
+func isRunning(_ pattern: String) -> Bool { shell("/usr/bin/pgrep", ["-f", pattern]).status == 0 }
+
+// Quit the OneDrive app and its File Provider helper (macOS may relaunch the helper on demand).
+func stopOneDrive() -> Bool {
+    shell("/usr/bin/osascript", ["-e", "quit app \"OneDrive\""])
+    var waited = 0
+    while isRunning("/Applications/OneDrive.app/Contents/MacOS/OneDrive") && waited < 15 {
+        Thread.sleep(forTimeInterval: 1)
+        waited += 1
+    }
+    shell("/usr/bin/pkill", ["-f", "OneDrive File Provider"])
+    Thread.sleep(forTimeInterval: 2)
+    return !isRunning("/Applications/OneDrive.app/")
+}
+
+func startOneDrive() {
+    shell("/usr/bin/open", ["-a", "OneDrive"])
+}
+
+// Copies both OneDrive databases into a timestamped folder; keeps the newest few.
+func backupOneDriveDatabases() -> URL? {
+    let fm = FileManager.default
+    guard fm.fileExists(atPath: oneDriveDB), fm.fileExists(atPath: syncEngineDB) else { return nil }
+    let stamp = DateFormatter()
+    stamp.dateFormat = "yyyyMMdd-HHmmss"
+    let dir = backupRoot.appendingPathComponent(stamp.string(from: Date()))
+    do {
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        for db in [oneDriveDB, syncEngineDB] {
+            for path in [db, db + "-wal", db + "-shm"] where fm.fileExists(atPath: path) {
+                try fm.copyItem(atPath: path, toPath: dir.appendingPathComponent((path as NSString).lastPathComponent).path)
+            }
+        }
+        let old = try fm.contentsOfDirectory(at: backupRoot, includingPropertiesForKeys: nil)
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }.dropLast(backupsToKeep)
+        old.forEach { try? fm.removeItem(at: $0) }
+    } catch {
+        log("backup failed: \(error.localizedDescription)")
+        return nil
+    }
+    return dir
+}
+
+// Pin state 2 -> 0 and flag bit 8 off for these items (files only), both databases checked after.
+func clearOneDriveMarks(_ ids: [String]) -> Bool {
+    let numeric = ids.filter { !$0.isEmpty && $0.allSatisfy(\.isNumber) }
+    guard !numeric.isEmpty else { return true }
+    let list = numeric.joined(separator: ",")
+    let sql = """
+        .bail on
+        ATTACH '\(oneDriveDB)' AS fp;
+        BEGIN IMMEDIATE;
+        UPDATE od_ClientFile_Records SET lastKnownPinState = 0
+         WHERE lastKnownPinState = 2 AND itemIndex IN (SELECT fsid FROM fp.dbfs_files WHERE itemid IN (\(list)));
+        SELECT 'pin state 2 -> 0: ' || changes();
+        UPDATE fp.dbfs_files SET state_flags = state_flags & ~8
+         WHERE itemid IN (\(list)) AND filetype = 0 AND (state_flags & 8) != 0 AND (state_flags & 32) != 0;
+        SELECT 'mark cleared: ' || changes();
+        COMMIT;
+        PRAGMA main.integrity_check;
+        PRAGMA fp.integrity_check;
+        """
+    let script = FileManager.default.temporaryDirectory.appendingPathComponent("clear-marks-\(UUID().uuidString).sql")
+    guard (try? sql.write(to: script, atomically: true, encoding: .utf8)) != nil else { return false }
+    defer { try? FileManager.default.removeItem(at: script) }
+    let result = shell("/usr/bin/sqlite3", [syncEngineDB, ".read \(script.path)"])
+    log("OneDrive records: status \(result.status): \(result.output)")
+    let okCount = result.output.split(separator: "\n").filter { $0 == "ok" }.count
+    return result.status == 0 && okCount == 2
+}
+
+// How many of these items macOS still has at policy 3 ("keep downloaded").
+func policyThreeCount(_ ids: [String], fileProviderDB: String) -> Int? {
+    let numeric = ids.filter { !$0.isEmpty && $0.allSatisfy(\.isNumber) }
+    guard !numeric.isEmpty else { return 0 }
+    let list = numeric.map { "CAST('\($0)' AS BLOB)" }.joined(separator: ",")
+    let result = shell("/usr/bin/sqlite3", ["-readonly", fileProviderDB,
+        "SELECT count(*) FROM FP_snapshot WHERE decoration_content_policy = 3 AND id IN (\(list));"])
+    return result.status == 0 ? Int(result.output.trimmingCharacters(in: .whitespacesAndNewlines)) : nil
+}
+
 func forceFreeUp(_ urls: [URL]) {
     log("request: \(urls.map(\.path))")
     let oneDriveRoot = home.appendingPathComponent("Library/CloudStorage").path + "/OneDrive"
@@ -174,28 +268,49 @@ func forceFreeUp(_ urls: [URL]) {
         return
     }
 
-    let files = downloadedFiles(in: urls)
+    // All files in the selection: cloud-only ones still at policy 3 would download on the next
+    // fileproviderd restart, so they get fixed too.
+    let allFiles = regularFiles(in: urls)
+    let files = allFiles.filter(isDownloadedFile)
     guard !files.isEmpty else {
         notify("Nothing to free: already cloud-only.")
         return
     }
     notify("Freeing \(fileCount(files.count))…")
-
-    let ids = files.compactMap(itemIdentifier)
+    let ids = allFiles.compactMap(itemIdentifier)
     log("item ids (for rollback): \(ids.joined(separator: " "))")
+
+    // 1. Stop OneDrive for the whole run and back up its databases.
+    guard stopOneDrive() else {
+        startOneDrive()
+        notify("Couldn't stop OneDrive, nothing changed.")
+        return
+    }
+    var oneDriveStarted = false
+    defer { if !oneDriveStarted { startOneDrive() } }  // always restart OneDrive, even on early exit
+    guard let backup = backupOneDriveDatabases() else {
+        notify("Couldn't back up OneDrive's databases, nothing changed.")
+        return
+    }
+    log("OneDrive backup: \(backup.path)")
+
+    // 2. macOS records: policy 3 -> 1, then let fileproviderd reload and settle.
     let result = shell("/usr/bin/python3", ["-I", policyScript, "auto"] + ids)
     log("fp_set_policy: status \(result.status): \(result.output)")
     guard result.status == 0 else {
         notify("Couldn't update File Provider records. Grant Full Disk Access to \(appName). Log: ~/Library/Logs/OneDriveFreeUpFixer.log")
         return
     }
+    let fileProviderDB = result.output.split(separator: "\n").first { $0.hasPrefix("database: ") }
+        .map { String($0.dropFirst("database: ".count)) }
     let changed = result.output.range(of: #"updated (\d+) of"#, options: .regularExpression)
         .flatMap { Int(result.output[$0].split(separator: " ")[1]) } ?? 0
-    if changed > 0 {  // make fileproviderd reload its records
+    if changed > 0 {
         shell("/usr/bin/killall", ["fileproviderd"])
-        Thread.sleep(forTimeInterval: 10)
+        Thread.sleep(forTimeInterval: 30)
     }
 
+    // 3. Free the downloaded files with the macOS call.
     var freed: Int64 = 0, failed = 0
     for file in files {
         let size = Int64(fileStat(file)?.st_blocks ?? 0) * 512
@@ -207,8 +322,24 @@ func forceFreeUp(_ urls: [URL]) {
             log("evict failed: \(file.path): \(error.localizedDescription)")
         }
     }
+
+    // 4. OneDrive records: clear its "freed" marks so it can't push "keep downloaded" back later.
+    // The helper may have been relaunched while freeing; only edit once it's really stopped.
+    let marksCleared = stopOneDrive() && clearOneDriveMarks(ids)
+
+    // 5. Start OneDrive, then 6. check what came back.
+    startOneDrive()
+    oneDriveStarted = true
+    Thread.sleep(forTimeInterval: 60)
+    let backOnDisk = files.filter(isDownloadedFile).count
+    let stillPolicyThree = fileProviderDB.flatMap { policyThreeCount(ids, fileProviderDB: $0) } ?? 0
+
     let freedText = ByteCountFormatter.string(fromByteCount: freed, countStyle: .file)
-    let summary = "Freed \(freedText) from \(fileCount(files.count - failed))" + (failed > 0 ? ", \(failed) failed" : "")
+    var summary = "Freed \(freedText) from \(fileCount(files.count - failed))"
+    if failed > 0 { summary += ", \(failed) failed" }
+    if backOnDisk > 0 { summary += ", \(fileCount(backOnDisk)) back on disk" }
+    if stillPolicyThree > 0 { summary += ", \(fileCount(stillPolicyThree)) at keep-downloaded" }
+    if !marksCleared { summary += ". OneDrive records not updated, see log" }
     log(summary)
     notify(summary)
 }
