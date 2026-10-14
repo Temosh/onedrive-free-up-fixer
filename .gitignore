@@ -1,0 +1,37 @@
+# Build output
+build/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.TemporaryItems
+.DocumentRevisions-V100
+.VolumeIcon.icns
+Icon?
+
+# JetBrains IDEs (IntelliJ IDEA, AppCode, ...)
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+# VS Code
+.vscode/
+*.code-workspace
+.history/
+
+# Xcode / Swift
+DerivedData/
+.build/
+.swiftpm/
+xcuserdata/
+
+# Python
+__pycache__/
+*.py[cod]
